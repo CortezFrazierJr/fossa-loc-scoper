@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+"""fossa-loc-scoper — scope a repo's lines of code for FOSSA one-time scan pricing.
+
+Point it at a local checkout or a git URL. It produces a defensible, reproducible
+LOC number: first-party code lines (non-blank, non-comment), with everything else
+bucketed and reported instead of silently dropped.
+
+  ./fossa-loc-scoper.py /path/to/repo
+  ./fossa-loc-scoper.py https://github.com/org/repo.git
+  ./fossa-loc-scoper.py /path/to/repo --json
+  ./fossa-loc-scoper.py /path/to/repo --exclude 'docs/**' --top 15
+
+Zero dependencies (python3 stdlib). Respects .fossa.yml paths.only / paths.exclude
+when present so the scoped number matches what a FOSSA scan would cover.
+Buckets: code (headline) | vendored | generated | minified | data | binary | other.
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import shutil
+import fnmatch
+from collections import defaultdict
+from datetime import datetime, timezone
+
+VERSION = "1.0.0"
+
+# ---------------------------------------------------------------- language map
+# family: c = // and /* */ ; hash = # ; dash = -- (opt. block) ; html = <!-- -->
+LANGS = {
+    ".c": ("C", "c"), ".h": ("C/C++ Header", "c"), ".cpp": ("C++", "c"),
+    ".cc": ("C++", "c"), ".cxx": ("C++", "c"), ".hpp": ("C/C++ Header", "c"),
+    ".hh": ("C/C++ Header", "c"), ".java": ("Java", "c"), ".js": ("JavaScript", "c"),
+    ".mjs": ("JavaScript", "c"), ".cjs": ("JavaScript", "c"), ".jsx": ("JSX", "c"),
+    ".ts": ("TypeScript", "c"), ".tsx": ("TSX", "c"), ".go": ("Go", "c"),
+    ".rs": ("Rust", "c"), ".swift": ("Swift", "c"), ".kt": ("Kotlin", "c"),
+    ".kts": ("Kotlin", "c"), ".scala": ("Scala", "c"), ".cs": ("C#", "c"),
+    ".m": ("Objective-C", "c"), ".mm": ("Objective-C++", "c"), ".php": ("PHP", "c"),
+    ".dart": ("Dart", "c"), ".groovy": ("Groovy", "c"), ".gradle": ("Gradle", "c"),
+    ".proto": ("Protobuf", "c"), ".css": ("CSS", "c"), ".scss": ("SCSS", "c"),
+    ".less": ("LESS", "c"), ".sass": ("SCSS", "c"), ".vue": ("Vue", "c"),
+    ".svelte": ("Svelte", "c"),
+    ".py": ("Python", "hash"), ".sh": ("Shell", "hash"), ".bash": ("Shell", "hash"),
+    ".zsh": ("Shell", "hash"), ".rb": ("Ruby", "hash"), ".pl": ("Perl", "hash"),
+    ".pm": ("Perl", "hash"), ".r": ("R", "hash"), ".jl": ("Julia", "hash"),
+    ".tcl": ("Tcl", "hash"), ".ex": ("Elixir", "hash"), ".exs": ("Elixir", "hash"),
+    ".ps1": ("PowerShell", "hash"), ".tf": ("Terraform", "hash"), ".nix": ("Nix", "hash"),
+    ".cmake": ("CMake", "hash"),
+    ".sql": ("SQL", "dash"), ".lua": ("Lua", "dash"), ".hs": ("Haskell", "dash"),
+    ".elm": ("Elm", "dash"), ".vhd": ("VHDL", "dash"), ".adb": ("Ada", "dash"),
+    ".html": ("HTML", "html"), ".htm": ("HTML", "html"),
+    ".f": ("Fortran", "none"), ".f90": ("Fortran", "none"), ".asm": ("Assembly", "none"),
+    ".s": ("Assembly", "none"), ".v": ("Verilog", "c"), ".sv": ("Verilog", "c"),
+    ".zig": ("Zig", "c"), ".erl": ("Erlang", "none"), ".ml": ("OCaml", "none"),
+    ".clj": ("Clojure", "none"), ".cljs": ("Clojure", "none"), ".fs": ("F#", "c"),
+}
+SPECIAL_FILENAMES = {
+    "makefile": ("Makefile", "hash"), "dockerfile": ("Dockerfile", "hash"),
+    "cmakelists.txt": ("CMake", "hash"), "rakefile": ("Ruby", "hash"),
+    "gemfile": ("Ruby", "hash"), "jenkinsfile": ("Groovy", "c"),
+}
+
+DATA_EXTS = {
+    ".json", ".yaml", ".yml", ".toml", ".xml", ".csv", ".tsv", ".md", ".rst",
+    ".txt", ".lock", ".svg", ".plist", ".properties", ".ini", ".cfg", ".conf",
+    ".env", ".graphql", ".gql", ".ipynb", ".pom",
+}
+BINARY_EXTS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".bmp", ".tiff", ".pdf",
+    ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar", ".jar", ".war", ".aar",
+    ".class", ".so", ".dylib", ".dll", ".exe", ".bin", ".o", ".a", ".ko",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot", ".mp3", ".mp4", ".mov", ".avi",
+    ".wav", ".flac", ".apk", ".ipa", ".dmg", ".iso", ".img", ".pyc", ".wasm",
+    ".pack", ".idx", ".db", ".sqlite", ".rlib", ".keystore", ".jks", ".p12",
+}
+
+VENDOR_DIRS = {
+    "node_modules", "vendor", "vendors", "third_party", "thirdparty", "3rdparty",
+    "third-party", "pods", "carthage", "bower_components", "jspm_packages",
+    "site-packages", "external", "externals",
+}
+ENV_DIRS = {".venv", "venv", "virtualenv", ".tox", ".mypy_cache", "__pycache__",
+            ".pytest_cache", ".ruff_cache"}
+BUILD_DIRS = {"dist", "dist-newstyle", ".stack-work", "build", "out", "output", "target", ".gradle", ".next",
+              ".nuxt", ".output", "cmake-build-debug", "cmake-build-release",
+              "coverage", ".nyc_output", "derioveddata", "deriveddata"}
+VCS_DIRS = {".git", ".hg", ".svn", ".bzr", ".idea", ".vscode", ".ds_store"}
+
+GENERATED_NAME_RE = re.compile(
+    r"(\.pb\.(go|cc|h|swift)$|_pb2(_grpc)?\.py$|\.g\.dart$|\.generated\.|"
+    r"\.designer\.cs$|_generated\.(go|rs|ts|js)$|schema\.graphql$)", re.I)
+GENERATED_MARKER_RE = re.compile(
+    r"(do not edit|@generated|code generated by|auto-?generated|automatically generated|"
+    r"this file was generated|generated file)", re.I)
+MINIFIED_LINE_LEN = 3000
+
+
+def classify_dir(name):
+    n = name.lower()
+    if n in VCS_DIRS: return "skip"
+    if n in VENDOR_DIRS: return "vendored"
+    if n in ENV_DIRS or n in BUILD_DIRS: return "build-output"
+    return None
+
+
+def looks_binary(path):
+    try:
+        with open(path, "rb") as f:
+            return b"\x00" in f.read(8000)
+    except OSError:
+        return True
+
+
+def read_text(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def count_code_lines(text, family):
+    """Return (code_lines, comment_lines, blank_lines). Pragmatic comment
+    stripping: block-comment state machine per family, no string-literal
+    awareness (same tradeoff cloc makes). Unknown family: non-blank = code."""
+    code = comment = blank = 0
+    if family == "c":
+        line_m, block_o, block_c = "//", "/*", "*/"
+    elif family == "hash":
+        line_m, block_o, block_c = "#", None, None
+    elif family == "dash":
+        line_m, block_o, block_c = "--", "--[[", "]]"
+    elif family == "html":
+        line_m, block_o, block_c = None, "<!--", "-->"
+    else:
+        line_m = block_o = block_c = None
+    in_block = False
+    for raw in text.splitlines():
+        s = raw.strip()
+        if not s:
+            blank += 1
+            continue
+        if in_block:
+            comment += 1
+            if block_c and block_c in s:
+                in_block = False
+            continue
+        if line_m and s.startswith(line_m):
+            comment += 1
+            continue
+        if block_o and s.startswith(block_o):
+            comment += 1
+            if not (block_c and block_c in s[len(block_o):]):
+                in_block = True
+            continue
+        code += 1
+    return code, comment, blank
+
+
+def parse_fossa_yml(root):
+    """Best-effort hand parse of .fossa.yml paths.only / paths.exclude
+    (stdlib has no YAML). Returns (only, exclude) lists of path prefixes."""
+    for name in (".fossa.yml", ".fossa.yaml"):
+        p = os.path.join(root, name)
+        if os.path.isfile(p):
+            break
+    else:
+        return [], []
+    only, exclude, section, sub = [], [], None, None
+    txt = read_text(p) or ""
+    for line in txt.splitlines():
+        if re.match(r"^paths:\s*$", line):
+            section = "paths"; sub = None; continue
+        if section == "paths":
+            m = re.match(r"^\s{2,}(only|exclude):\s*$", line)
+            if m:
+                sub = m.group(1); continue
+            m = re.match(r"^\s+-\s*['\"]?([^'\"#]+?)['\"]?\s*$", line)
+            if m and sub:
+                (only if sub == "only" else exclude).append(m.group(1).strip().strip("/"))
+                continue
+            if line and not line[0].isspace():
+                section = sub = None
+    return only, exclude
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("target", help="local repo path or git URL")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--exclude", action="append", default=[], metavar="GLOB",
+                    help="extra exclude glob(s), relative to repo root (repeatable)")
+    ap.add_argument("--no-fossa-yml", action="store_true", help="ignore .fossa.yml path filters")
+    ap.add_argument("--top", type=int, default=12, help="rows in language/dir tables (default 12)")
+    args = ap.parse_args()
+
+    tmpdir = None
+    target = args.target
+    if re.match(r"^(https?://|git@|ssh://)", target):
+        tmpdir = tempfile.mkdtemp(prefix="loc-scoper-")
+        print(f"cloning {target} (depth 1) ...", file=sys.stderr)
+        r = subprocess.run(["git", "clone", "--depth", "1", "--quiet", target, tmpdir])
+        if r.returncode != 0:
+            print("clone failed", file=sys.stderr); sys.exit(1)
+        root = tmpdir
+    else:
+        root = os.path.abspath(target)
+        if not os.path.isdir(root):
+            print(f"not a directory: {root}", file=sys.stderr); sys.exit(1)
+
+    commit = ""
+    try:
+        commit = subprocess.run(["git", "-C", root, "rev-parse", "--short", "HEAD"],
+                                capture_output=True, text=True).stdout.strip()
+    except OSError:
+        pass
+
+    only, yml_exclude = ([], []) if args.no_fossa_yml else parse_fossa_yml(root)
+    extra_excludes = [g.strip("/") for g in args.exclude]
+
+    def path_filtered(rel):
+        rp = rel.replace(os.sep, "/")
+        if only and not any(rp == o or rp.startswith(o + "/") for o in only):
+            return "outside paths.only"
+        for e in yml_exclude:
+            if rp == e or rp.startswith(e + "/"):
+                return "paths.exclude"
+        for g in extra_excludes:
+            if fnmatch.fnmatch(rp, g) or rp.startswith(g + "/"):
+                return "--exclude"
+        return None
+
+    # buckets: name -> {"files": int, "lines": int}
+    buckets = defaultdict(lambda: {"files": 0, "lines": 0})
+    langs = defaultdict(lambda: {"files": 0, "code": 0, "comment": 0, "blank": 0})
+    topdirs = defaultdict(int)          # first-party code lines per top-level dir
+    filtered = defaultdict(int)         # filter reason -> files
+    vendored_langs = defaultdict(int)
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel_dir = os.path.relpath(dirpath, root)
+        rel_dir = "" if rel_dir == "." else rel_dir
+        # prune + tag directories
+        keep = []
+        dir_bucket = None
+        for d in list(dirnames):
+            c = classify_dir(d)
+            if c == "skip":
+                continue
+            keep.append(d)
+        dirnames[:] = sorted(keep)
+        # is THIS directory inside a vendored/build tree?
+        parts = [p.lower() for p in rel_dir.split(os.sep) if p]
+        if any(p in VENDOR_DIRS for p in parts):
+            dir_bucket = "vendored"
+        elif any(p in ENV_DIRS or p in BUILD_DIRS for p in parts):
+            dir_bucket = "build-output"
+
+        for fn in sorted(filenames):
+            rel = os.path.join(rel_dir, fn) if rel_dir else fn
+            full = os.path.join(dirpath, fn)
+            if os.path.islink(full):
+                continue
+            reason = path_filtered(rel)
+            if reason:
+                filtered[reason] += 1
+                continue
+            ext = os.path.splitext(fn)[1].lower()
+            lname = fn.lower()
+
+            if ext in BINARY_EXTS:
+                buckets["binary"]["files"] += 1
+                continue
+
+            lang = LANGS.get(ext) or SPECIAL_FILENAMES.get(lname)
+            is_data = ext in DATA_EXTS
+
+            if dir_bucket:  # vendored or build-output tree
+                if lang or is_data:
+                    text = read_text(full)
+                    n = sum(1 for l in (text or "").splitlines() if l.strip())
+                    buckets[dir_bucket]["files"] += 1
+                    buckets[dir_bucket]["lines"] += n
+                    if dir_bucket == "vendored" and lang:
+                        vendored_langs[lang[0]] += n
+                else:
+                    buckets[dir_bucket]["files"] += 1
+                continue
+
+            if is_data and not lang:
+                text = read_text(full)
+                n = sum(1 for l in (text or "").splitlines() if l.strip())
+                buckets["data"]["files"] += 1
+                buckets["data"]["lines"] += n
+                continue
+
+            if not lang:
+                if looks_binary(full):
+                    buckets["binary"]["files"] += 1
+                else:
+                    text = read_text(full)
+                    n = sum(1 for l in (text or "").splitlines() if l.strip())
+                    buckets["other"]["files"] += 1
+                    buckets["other"]["lines"] += n
+                continue
+
+            # candidate first-party code file
+            if looks_binary(full):
+                buckets["binary"]["files"] += 1
+                continue
+            text = read_text(full)
+            if text is None:
+                buckets["binary"]["files"] += 1
+                continue
+
+            # minified?
+            if (lname.endswith(".min.js") or lname.endswith(".min.css")
+                    or (ext in (".js", ".css") and any(len(l) > MINIFIED_LINE_LEN for l in text.splitlines()[:50]))):
+                n = sum(1 for l in text.splitlines() if l.strip())
+                buckets["minified"]["files"] += 1
+                buckets["minified"]["lines"] += n
+                continue
+
+            # generated?
+            head = "\n".join(text.splitlines()[:20])
+            if GENERATED_NAME_RE.search(fn) or GENERATED_MARKER_RE.search(head):
+                n = sum(1 for l in text.splitlines() if l.strip())
+                buckets["generated"]["files"] += 1
+                buckets["generated"]["lines"] += n
+                continue
+
+            name, family = lang
+            code, comment, blank = count_code_lines(text, family)
+            buckets["code"]["files"] += 1
+            buckets["code"]["lines"] += code
+            langs[name]["files"] += 1
+            langs[name]["code"] += code
+            langs[name]["comment"] += comment
+            langs[name]["blank"] += blank
+            top = rel.replace(os.sep, "/").split("/")[0] if "/" in rel.replace(os.sep, "/") else "(root)"
+            topdirs[top] += code
+
+    if tmpdir:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    headline = buckets["code"]["lines"]
+    vendored = buckets["vendored"]["lines"]
+    result = {
+        "scoper_version": VERSION,
+        "target": args.target,
+        "commit": commit,
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "metric": "first-party code lines (non-blank, non-comment; docstrings count as code)",
+        "headline_first_party_code_lines": headline,
+        "first_party_plus_vendored_lines": headline + vendored,
+        "buckets": {k: dict(v) for k, v in sorted(buckets.items())},
+        "languages": {k: dict(v) for k, v in sorted(langs.items(), key=lambda x: -x[1]["code"])},
+        "top_level_dirs_code_lines": dict(sorted(topdirs.items(), key=lambda x: -x[1])),
+        "vendored_languages_nonblank": dict(sorted(vendored_langs.items(), key=lambda x: -x[1])),
+        "path_filters": {"fossa_yml_only": only, "fossa_yml_exclude": yml_exclude,
+                         "cli_exclude": extra_excludes,
+                         "files_filtered": dict(filtered)},
+    }
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return
+
+    W = 66
+    def line(c="-"): print(c * W)
+    def row(a, b, c=""):
+        print(f"{a:<38}{b:>14}{c:>14}")
+
+    line("=")
+    print(f"FOSSA one-time scan LOC scope  v{VERSION}")
+    print(f"target: {args.target}" + (f"  @ {commit}" if commit else ""))
+    print(f"metric: first-party code lines (non-blank, non-comment)")
+    line("=")
+    print(f"\n  HEADLINE  first-party code lines: {headline:>14,}\n")
+    print(f"  with vendored included:            {headline + vendored:>14,}")
+    print(f"  (use the second number if the scan scope includes vendored code)\n")
+    line()
+    row("bucket", "files", "lines")
+    line()
+    order = ["code", "vendored", "build-output", "generated", "minified", "data", "other", "binary"]
+    for k in order:
+        if k in buckets:
+            b = buckets[k]
+            row(k, f"{b['files']:,}", f"{b['lines']:,}" if k != "binary" else "n/a")
+    line()
+    print("\nlanguages (first-party code):")
+    row("language", "files", "code lines")
+    line()
+    for name, d in list(result["languages"].items())[: args.top]:
+        row(name, f"{d['files']:,}", f"{d['code']:,}")
+    rest = list(result["languages"].items())[args.top:]
+    if rest:
+        row(f"(+{len(rest)} more)", "", f"{sum(d['code'] for _, d in rest):,}")
+    print("\ntop-level dirs (first-party code lines):")
+    for name, n in list(result["top_level_dirs_code_lines"].items())[: args.top]:
+        row(name, "", f"{n:,}")
+    if only or yml_exclude or extra_excludes:
+        print("\npath filters applied:")
+        if only: print(f"  .fossa.yml paths.only: {only}")
+        if yml_exclude: print(f"  .fossa.yml paths.exclude: {yml_exclude}")
+        if extra_excludes: print(f"  --exclude: {extra_excludes}")
+        for r, n in filtered.items():
+            print(f"  filtered ({r}): {n:,} files")
+    print()
+
+
+if __name__ == "__main__":
+    main()
