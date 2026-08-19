@@ -27,7 +27,7 @@ import fnmatch
 from collections import defaultdict
 from datetime import datetime, timezone
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # ---------------------------------------------------------------- language map
 # family: c = // and /* */ ; hash = # ; dash = -- (opt. block) ; html = <!-- -->
@@ -121,6 +121,14 @@ def read_text(path):
             return f.read()
     except OSError:
         return None
+
+
+def human_size(n):
+    """1024-base auto-scale (du/cloc convention)."""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:,} B" if unit == "B" else f"{n:.2f} {unit}"
+        n /= 1024
 
 
 def count_code_lines(text, family):
@@ -235,10 +243,12 @@ def main():
         return None
 
     # buckets: name -> {"files": int, "lines": int}
-    buckets = defaultdict(lambda: {"files": 0, "lines": 0})
+    buckets = defaultdict(lambda: {"files": 0, "lines": 0, "bytes": 0})
     langs = defaultdict(lambda: {"files": 0, "code": 0, "comment": 0, "blank": 0})
     topdirs = defaultdict(int)          # first-party code lines per top-level dir
     filtered = defaultdict(int)         # filter reason -> files
+    filtered_bytes = 0
+    total_bytes = 0                     # every regular file in the walk (excl. VCS dirs)
     vendored_langs = defaultdict(int)
 
     for dirpath, dirnames, filenames in os.walk(root):
@@ -265,15 +275,26 @@ def main():
             full = os.path.join(dirpath, fn)
             if os.path.islink(full):
                 continue
+            try:
+                fsize = os.path.getsize(full)
+            except OSError:
+                fsize = 0
+            total_bytes += fsize
             reason = path_filtered(rel)
             if reason:
                 filtered[reason] += 1
+                filtered_bytes += fsize
                 continue
             ext = os.path.splitext(fn)[1].lower()
             lname = fn.lower()
 
+            def put(bucket, lines=0):
+                buckets[bucket]["files"] += 1
+                buckets[bucket]["lines"] += lines
+                buckets[bucket]["bytes"] += fsize
+
             if ext in BINARY_EXTS:
-                buckets["binary"]["files"] += 1
+                put("binary")
                 continue
 
             lang = LANGS.get(ext) or SPECIAL_FILENAMES.get(lname)
@@ -283,60 +304,54 @@ def main():
                 if lang or is_data:
                     text = read_text(full)
                     n = sum(1 for l in (text or "").splitlines() if l.strip())
-                    buckets[dir_bucket]["files"] += 1
-                    buckets[dir_bucket]["lines"] += n
+                    put(dir_bucket, n)
                     if dir_bucket == "vendored" and lang:
                         vendored_langs[lang[0]] += n
                 else:
-                    buckets[dir_bucket]["files"] += 1
+                    put(dir_bucket)
                 continue
 
             if is_data and not lang:
                 text = read_text(full)
                 n = sum(1 for l in (text or "").splitlines() if l.strip())
-                buckets["data"]["files"] += 1
-                buckets["data"]["lines"] += n
+                put("data", n)
                 continue
 
             if not lang:
                 if looks_binary(full):
-                    buckets["binary"]["files"] += 1
+                    put("binary")
                 else:
                     text = read_text(full)
                     n = sum(1 for l in (text or "").splitlines() if l.strip())
-                    buckets["other"]["files"] += 1
-                    buckets["other"]["lines"] += n
+                    put("other", n)
                 continue
 
             # candidate first-party code file
             if looks_binary(full):
-                buckets["binary"]["files"] += 1
+                put("binary")
                 continue
             text = read_text(full)
             if text is None:
-                buckets["binary"]["files"] += 1
+                put("binary")
                 continue
 
             # minified?
             if (lname.endswith(".min.js") or lname.endswith(".min.css")
                     or (ext in (".js", ".css") and any(len(l) > MINIFIED_LINE_LEN for l in text.splitlines()[:50]))):
                 n = sum(1 for l in text.splitlines() if l.strip())
-                buckets["minified"]["files"] += 1
-                buckets["minified"]["lines"] += n
+                put("minified", n)
                 continue
 
             # generated?
             head = "\n".join(text.splitlines()[:20])
             if GENERATED_NAME_RE.search(fn) or GENERATED_MARKER_RE.search(head):
                 n = sum(1 for l in text.splitlines() if l.strip())
-                buckets["generated"]["files"] += 1
-                buckets["generated"]["lines"] += n
+                put("generated", n)
                 continue
 
             name, family = lang
             code, comment, blank = count_code_lines(text, family)
-            buckets["code"]["files"] += 1
-            buckets["code"]["lines"] += code
+            put("code", code)
             langs[name]["files"] += 1
             langs[name]["code"] += code
             langs[name]["comment"] += comment
@@ -357,6 +372,12 @@ def main():
         "metric": "first-party code lines (non-blank, non-comment; docstrings count as code)",
         "headline_first_party_code_lines": headline,
         "first_party_plus_vendored_lines": headline + vendored,
+        "codebase_size_bytes": total_bytes,
+        "codebase_size_human": human_size(total_bytes),
+        "first_party_code_size_bytes": buckets["code"]["bytes"],
+        "first_party_code_size_human": human_size(buckets["code"]["bytes"]),
+        "size_note": "working tree, VCS metadata (.git etc.) excluded; symlinks skipped; filtered files included in codebase size",
+        "filtered_bytes": filtered_bytes,
         "buckets": {k: dict(v) for k, v in sorted(buckets.items())},
         "languages": {k: dict(v) for k, v in sorted(langs.items(), key=lambda x: -x[1]["code"])},
         "top_level_dirs_code_lines": dict(sorted(topdirs.items(), key=lambda x: -x[1])),
@@ -374,23 +395,27 @@ def main():
     def line(c="-"): print(c * W)
     def row(a, b, c=""):
         print(f"{a:<38}{b:>14}{c:>14}")
+    def row2(a, b, c, d):
+        print(f"{a:<26}{b:>12}{c:>14}{d:>14}")
 
     line("=")
     print(f"FOSSA one-time scan LOC scope  v{VERSION}")
     print(f"target: {args.target}" + (f"  @ {commit}" if commit else ""))
     print(f"metric: first-party code lines (non-blank, non-comment)")
     line("=")
-    print(f"\n  HEADLINE  first-party code lines: {headline:>14,}\n")
+    print(f"\n  HEADLINE  first-party code lines: {headline:>14,}")
+    print(f"  HEADLINE  codebase size:           {human_size(total_bytes):>14}   (working tree, excl. VCS metadata)\n")
     print(f"  with vendored included:            {headline + vendored:>14,}")
-    print(f"  (use the second number if the scan scope includes vendored code)\n")
+    print(f"  (use the second number if the scan scope includes vendored code)")
+    print(f"  first-party code size:             {human_size(buckets['code']['bytes']):>14}\n")
     line()
-    row("bucket", "files", "lines")
+    row2("bucket", "files", "lines", "size")
     line()
     order = ["code", "vendored", "build-output", "generated", "minified", "data", "other", "binary"]
     for k in order:
         if k in buckets:
             b = buckets[k]
-            row(k, f"{b['files']:,}", f"{b['lines']:,}" if k != "binary" else "n/a")
+            row2(k, f"{b['files']:,}", f"{b['lines']:,}" if k != "binary" else "n/a", human_size(b["bytes"]))
     line()
     print("\nlanguages (first-party code):")
     row("language", "files", "code lines")
@@ -410,6 +435,7 @@ def main():
         if extra_excludes: print(f"  --exclude: {extra_excludes}")
         for r, n in filtered.items():
             print(f"  filtered ({r}): {n:,} files")
+        print(f"  filtered files still count toward codebase size ({human_size(filtered_bytes)})")
     print()
 
 

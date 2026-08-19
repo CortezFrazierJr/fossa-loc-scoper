@@ -17,6 +17,8 @@ Zero dependencies: python3 stdlib only. Standalone from the fossa-cli binary on 
 
 Headline = first-party code lines: non-blank, non-comment lines in recognized source languages, excluding vendored trees, build output, generated files, minified assets, data files, and binaries. Comment stripping runs per language family (C-style, hash, dash, HTML); docstrings count as code. The output also prints first-party + vendored for scans whose scope includes vendored code.
 
+As of v1.1.0 the default output (no flag) also reports **overall codebase size** auto-scaled to B/KB/MB/GB — the full working tree excluding VCS metadata (`.git` etc.) and symlinks, with `.fossa.yml`/`--exclude`-filtered files still counted toward it — plus first-party code size and a per-bucket size column. JSON gains `codebase_size_bytes`, `codebase_size_human`, `first_party_code_size_bytes`, `first_party_code_size_human`, and `filtered_bytes`.
+
 ## Buckets (nothing is silently dropped)
 
 | Bucket       | Contents                                             | In headline?                             |
