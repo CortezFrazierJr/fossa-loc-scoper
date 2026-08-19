@@ -376,7 +376,7 @@ def main():
         "codebase_size_human": human_size(total_bytes),
         "first_party_code_size_bytes": buckets["code"]["bytes"],
         "first_party_code_size_human": human_size(buckets["code"]["bytes"]),
-        "size_note": "working tree, VCS metadata (.git etc.) excluded; symlinks skipped; filtered files included in codebase size",
+        "size_note": "working tree, VCS/IDE metadata (.git, .idea, .vscode etc.) excluded; symlinks skipped; filtered files included in codebase size",
         "filtered_bytes": filtered_bytes,
         "buckets": {k: dict(v) for k, v in sorted(buckets.items())},
         "languages": {k: dict(v) for k, v in sorted(langs.items(), key=lambda x: -x[1]["code"])},
@@ -404,7 +404,7 @@ def main():
     print(f"metric: first-party code lines (non-blank, non-comment)")
     line("=")
     print(f"\n  HEADLINE  first-party code lines: {headline:>14,}")
-    print(f"  HEADLINE  codebase size:           {human_size(total_bytes):>14}   (working tree, excl. VCS metadata)\n")
+    print(f"  HEADLINE  codebase size:           {human_size(total_bytes):>14}   (working tree, excl. VCS/IDE metadata)\n")
     print(f"  with vendored included:            {headline + vendored:>14,}")
     print(f"  (use the second number if the scan scope includes vendored code)")
     print(f"  first-party code size:             {human_size(buckets['code']['bytes']):>14}\n")
@@ -435,7 +435,8 @@ def main():
         if extra_excludes: print(f"  --exclude: {extra_excludes}")
         for r, n in filtered.items():
             print(f"  filtered ({r}): {n:,} files")
-        print(f"  filtered files still count toward codebase size ({human_size(filtered_bytes)})")
+        if filtered_bytes:
+            print(f"  filtered files still count toward codebase size ({human_size(filtered_bytes)})")
     print()
 
 
