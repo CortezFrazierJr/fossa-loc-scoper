@@ -67,15 +67,15 @@ site                                                         4,083
 
 Read it the way a scoping call goes: the codebase is **17.95 MB on disk**, but only **1.28 MB / 31,165 lines is first-party code** — the committed `dist/` tree (8.73 MB of build output), binaries, and data files are bucketed out of the headline instead of silently inflating it.
 
-Size fields in `--json` (excerpt):
+Size fields in `--json`, same bootstrap run (excerpt):
 
 ```json
 {
-  "headline_first_party_code_lines": 388,
-  "codebase_size_bytes": 31986,
-  "codebase_size_human": "31.24 KB",
-  "first_party_code_size_bytes": 18678,
-  "first_party_code_size_human": "18.24 KB",
+  "headline_first_party_code_lines": 31165,
+  "codebase_size_bytes": 18817183,
+  "codebase_size_human": "17.95 MB",
+  "first_party_code_size_bytes": 1344229,
+  "first_party_code_size_human": "1.28 MB",
   "filtered_bytes": 0,
   "size_note": "working tree, VCS/IDE metadata (.git, .idea, .vscode etc.) excluded; symlinks skipped; filtered files included in codebase size"
 }
@@ -115,4 +115,4 @@ Cross-checked against `scc` on the fossa-cli repo with matching exclusions: Hask
 - Comment stripping is a pragmatic state machine (same tradeoff cloc makes): no string-literal awareness, so a `/*` inside a string can miscount a line. Deterministic either way.
 - Vendor-dir detection is name-based. Unusual names need the human `--exclude` pass; the top-dirs table makes them visible.
 - Jupyter notebooks count as data (JSON containers); Fortran/OCaml/Clojure/Erlang count non-blank lines only.
-- URL mode shallow-clones with plain `git`; repos using Git LFS need `git-lfs` installed locally or the clone fails (run on a local checkout instead).
+- URL mode shallow-clones with plain `git`. Git-LFS repos are hazardous both ways: with orphaned LFS gitconfig the clone fails outright; with no LFS config at all the clone succeeds and LFS objects arrive as ~68-byte pointer files, so codebase size and the binary bucket silently undercount. Either way, run LFS repos from a full local checkout.
